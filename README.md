@@ -9,6 +9,8 @@ loses everything it hadn't written down.
 This tool gives them that visibility — automatically, with no changes to how you
 work.
 
+<sub>Built by **[Aluslabs](https://aluslabs.com)** — automation systems and AI integrations that eliminate manual work.</sub>
+
 ---
 
 ## The problem
@@ -303,6 +305,23 @@ path still exits 0.
 
 [`docs/design.md`](docs/design.md) — the full design, including how `rate_limits`
 was traced through Claude Code and why each trade-off was made.
+
+## Who built this
+
+Built by **[Aluslabs](https://aluslabs.com)** — we build automation systems and
+AI integrations that eliminate manual work and help teams ship faster.
+
+This tool came straight out of our own workflow. We run several Claude Code
+agents in parallel across client projects, and kept losing hours whenever one
+got force-stopped mid-task with its plan still sitting in context. So we fixed
+it, and open-sourced the fix.
+
+**What we do:** workflow automation, AI-powered internal tools, API engineering,
+custom dashboards, and SaaS MVPs — for marketing agencies, professional services
+firms, e-commerce brands, and SaaS teams. Fixed-price projects or monthly
+retainers, delivered founder-led.
+
+If manual process is eating your team's week, **[let's talk →](https://aluslabs.com)**
 
 ## License
 
