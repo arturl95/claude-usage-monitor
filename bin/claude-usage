@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+#
+# claude-usage - report Claude Code account usage limits.
+#
+# Reads the state published by usage-statusline.sh and merges it across every
+# recently-active session. Claude Code delivers rate_limits only to the
+# statusLine command, so that script is the sole producer and this is the sole
+# reader.
+#
+# Exit codes:
+#   0  success (with --check: usage is below the warn threshold)
+#   2  bad arguments
+#   3  --check only: usage is at or above the warn threshold
+#   4  state is stale - files exist, but none is recent enough to trust
+#   5  a required dependency is missing
+#   6  no state has ever been published
+#   7  a state file is corrupt
+
+set -u
+
+VERSION="1.0.0"
+
+: "${CLAUDE_CONFIG_DIR:=${HOME}/.claude}"
+: "${USAGE_WARN_PCT:=90}"
+: "${USAGE_FRESH_SECONDS:=300}"
+
+STATE_DIR="${CLAUDE_CONFIG_DIR}/usage-state"
+
+die() {
+    printf 'claude-usage: %s\n' "$1" >&2
+    exit "$2"
+}
+
+usage_text() {
+    cat <<'USAGE'
+Usage: claude-usage [--json | --check | --version | --help]
+
+  (no args)   Print a human-readable usage summary.
+  --json      Print the merged state as JSON.
+  --check     Exit 3 if usage is at or above USAGE_WARN_PCT, otherwise 0.
+  --version   Print the version.
+
+Environment:
+  CLAUDE_CONFIG_DIR     Claude config dir (default: ~/.claude)
+  USAGE_WARN_PCT        Warn threshold, percent (default: 90)
+  USAGE_FRESH_SECONDS   Max age of state to trust, seconds (default: 300)
+USAGE
+}
+
+mode="human"
+case "${1:-}" in
+    ""          ) mode="human" ;;
+    --json      ) mode="json" ;;
+    --check     ) mode="check" ;;
+    --version   ) printf '%s\n' "$VERSION"; exit 0 ;;
+    -h|--help   ) usage_text; exit 0 ;;
+    *           ) printf 'claude-usage: unknown argument: %s\n\n' "$1" >&2
+                  usage_text >&2
+                  exit 2 ;;
+esac
+
+command -v jq >/dev/null 2>&1 || die "jq is required but not installed" 5
+
+# date(1) differs between BSD (macOS) and GNU. Probe once.
+if date -r 0 '+%s' >/dev/null 2>&1; then
+    _date_flavor="bsd"
+else
+    _date_flavor="gnu"
+fi
+
+fmt_time() {
+    if [ "$_date_flavor" = "bsd" ]; then
+        date -r "$1" "$2"
+    else
+        date -d "@$1" "$2"
+    fi
+}
+
+fmt_duration() {
+    local secs="$1" hours mins
+    if [ "$secs" -le 0 ]; then
+        printf 'now'
+        return
+    fi
+    hours=$(( secs / 3600 ))
+    mins=$(( (secs % 3600) / 60 ))
+    if [ "$hours" -gt 0 ]; then
+        printf '%dh %dm' "$hours" "$mins"
+    else
+        printf '%dm' "$mins"
+    fi
+}
+
+[ -d "$STATE_DIR" ] || die "no usage state published yet (${STATE_DIR} does not exist). Is the status line installed? Run install.sh." 6
+
+# The warned/ subdirectory and monitor.log do not match *.json.
+files=()
+for f in "$STATE_DIR"/*.json; do
+    [ -e "$f" ] && files+=("$f")
+done
+
+[ "${#files[@]}" -gt 0 ] || die "no usage state published yet (${STATE_DIR} is empty). Is the status line installed? Run install.sh." 6
+
+now="$(date '+%s')"
+
+# Merge. For each window independently: keep only files written recently, take
+# the newest resets_at seen (so a window rollover does not get averaged with
+# the window it replaced), then the highest used_percentage reported for it.
+# Usage only rises within a window, so the highest recent report is the closest
+# estimate of the truth, and for an alarm the safe direction to err is high.
+read -r -d '' MERGE_FILTER <<'FILTER' || true
+def pick($window):
+    map(select(.[$window] != null
+               and (.[$window].used_percentage | type) == "number"
+               and (.[$window].resets_at | type) == "number")
+        | .[$window])
+    | if length == 0 then null
+      else (map(.resets_at) | max) as $newest
+         | map(select(.resets_at == $newest))
+         | { used_percentage: (map(.used_percentage) | max), resets_at: $newest }
+      end;
+
+map(select(type == "object"
+           and (.written_at | type) == "number"
+           and ($now - .written_at) <= $fresh))
+| { sources: length
+  , checked_at: $now
+  , five_hour: pick("five_hour")
+  , seven_day: pick("seven_day")
+  }
+FILTER
+
+if ! merged="$(jq -s --argjson now "$now" --argjson fresh "$USAGE_FRESH_SECONDS" \
+                  "$MERGE_FILTER" "${files[@]}" 2>/dev/null)"; then
+    # Name the offending file rather than reporting a vague parse failure.
+    for f in "${files[@]}"; do
+        jq -e . "$f" >/dev/null 2>&1 || die "corrupt state file: ${f} (delete it and it will be republished)" 7
+    done
+    die "could not merge usage state from ${STATE_DIR}" 7
+fi
+
+sources="$(printf '%s' "$merged" | jq -r '.sources')"
+five_pct="$(printf '%s' "$merged" | jq -r '.five_hour.used_percentage // empty')"
+week_pct="$(printf '%s' "$merged" | jq -r '.seven_day.used_percentage // empty')"
+
+if [ -z "$five_pct" ] && [ -z "$week_pct" ]; then
+    die "usage state is stale: ${#files[@]} file(s) in ${STATE_DIR}, none written in the last ${USAGE_FRESH_SECONDS}s. No Claude Code session is currently publishing." 4
+fi
+
+if [ "$mode" = "json" ]; then
+    printf '%s\n' "$merged"
+    exit 0
+fi
+
+# Highest percentage across the windows that reported, for --check.
+worst="$(printf '%s' "$merged" \
+    | jq -r '[.five_hour.used_percentage, .seven_day.used_percentage] | map(select(. != null)) | max')"
+
+if [ "$mode" = "check" ]; then
+    if awk -v a="$worst" -v b="$USAGE_WARN_PCT" 'BEGIN { exit !(a >= b) }'; then
+        printf 'usage at %.0f%% (threshold %s%%)\n' "$worst" "$USAGE_WARN_PCT"
+        exit 3
+    fi
+    printf 'usage at %.0f%% (threshold %s%%)\n' "$worst" "$USAGE_WARN_PCT"
+    exit 0
+fi
+
+print_window() {
+    local label="$1" pct="$2" resets="$3" remaining
+    [ -n "$pct" ] || return 0
+    remaining=$(( resets - now ))
+    printf '%-4s %3.0f%%  (resets %s, in %s)\n' \
+        "$label" "$pct" "$(fmt_time "$resets" '+%H:%M')" "$(fmt_duration "$remaining")"
+}
+
+print_window "5h:" "$five_pct" "$(printf '%s' "$merged" | jq -r '.five_hour.resets_at // 0')"
+print_window "7d:" "$week_pct" "$(printf '%s' "$merged" | jq -r '.seven_day.resets_at // 0')"
+printf 'from %s reporting session(s)\n' "$sources"
