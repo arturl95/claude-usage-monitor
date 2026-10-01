@@ -14,7 +14,6 @@ setup() {
     TMP="$(mktemp -d)"
     export CLAUDE_CONFIG_DIR="$TMP"
     export USAGE_WARN_PCT=90
-    export USAGE_FRESH_SECONDS=300
     NOW="$(date '+%s')"
 }
 
@@ -82,10 +81,17 @@ is "rollover -> newest resets_at kept"   "$(printf '%s' "$out" | jq -r '.five_ho
 teardown
 
 setup
-state s1 9999 62 $((NOW+3600)) - 0
+state s1 5 62 $((NOW-60)) - 0   # window already reset
 out="$("$BIN/claude-usage" --json 2>&1)"; rc=$?
-is  "all stale -> exit 4" "$rc" 4
-has "all stale -> says so" "$out" "stale"
+is  "all windows reset -> exit 4" "$rc" 4
+has "all windows reset -> says so" "$out" "stale"
+teardown
+
+setup
+state s1 9999 62 $((NOW+3600)) - 0   # old reading, window still open
+out="$("$BIN/claude-usage" --json 2>&1)"; rc=$?
+is  "old reading, open window -> exit 0" "$rc" 0
+is  "old reading, open window -> reports age" "$(printf '%s' "$out" | jq -r '.five_hour.age_seconds')" "9999"
 teardown
 
 setup
@@ -224,7 +230,7 @@ has "no state yet -> logged" "$(cat "$CLAUDE_CONFIG_DIR/usage-state/monitor.log"
 teardown
 
 setup
-state s1 9999 91 $((NOW+3600)) - 0
+state s1 5 91 $((NOW-60)) - 0
 out="$(hook_input sess-a | "$BIN/usage-warn-hook.sh")"; rc=$?
 has "stale state -> reports breakage" "$out" "usage monitor is not working"
 is  "stale state -> exit 0" "$rc" 0

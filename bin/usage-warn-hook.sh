@@ -72,18 +72,20 @@ main() {
     week_pct="$(printf '%s' "$state" | jq -r '.seven_day.used_percentage // empty' 2>/dev/null)"
 
     warn_window "$session_id" "five_hour" "5-hour" "$five_pct" \
-        "$(printf '%s' "$state" | jq -r '.five_hour.resets_at // empty' 2>/dev/null)"
+        "$(printf '%s' "$state" | jq -r '.five_hour.resets_at // empty' 2>/dev/null)" \
+        "$(printf '%s' "$state" | jq -r '.five_hour.age_seconds // empty' 2>/dev/null)"
     warn_window "$session_id" "seven_day" "7-day" "$week_pct" \
-        "$(printf '%s' "$state" | jq -r '.seven_day.resets_at // empty' 2>/dev/null)"
+        "$(printf '%s' "$state" | jq -r '.seven_day.resets_at // empty' 2>/dev/null)" \
+        "$(printf '%s' "$state" | jq -r '.seven_day.age_seconds // empty' 2>/dev/null)"
 
     return 0
 }
 
 warn_window() {
-    local session_id="$1" key="$2" label="$3" pct="$4" resets="$5"
-    local latch mins
+    local session_id="$1" key="$2" label="$3" pct="$4" resets="$5" age="$6"
+    local latch mins as_of
 
-    [ -n "$pct" ] && [ -n "$resets" ] || return 0
+    [ -n "$pct" ] && [ -n "$resets" ] && [ -n "$age" ] || return 0
     awk -v a="$pct" -v b="$USAGE_WARN_PCT" 'BEGIN { exit !(a >= b) }' || return 0
 
     # Latched per session, per window, per reset time. Without this the hook
@@ -97,8 +99,13 @@ warn_window() {
     mins=$(( (resets - $(date '+%s')) / 60 ))
     [ "$mins" -lt 0 ] && mins=0
 
-    emit "$(printf 'Claude Code usage is at %.0f%% of the %s limit, which resets in %d minutes. Sessions that hit the limit are force-stopped and lose unsaved progress. Consider wrapping up soon: record what is done, what is in flight, and the next concrete step somewhere durable, so a fresh session can pick this up.' \
-        "$pct" "$label" "$mins")"
+    # Readings go unrefreshed while the main thread waits on a subagent. Usage
+    # only rises within a window, so an old reading understates the truth.
+    as_of=""
+    [ "$age" -ge 60 ] && as_of="$(printf ' (as of %d minutes ago - it may be higher now)' $(( age / 60 )))"
+
+    emit "$(printf 'Claude Code usage is at %.0f%%%s of the %s limit, which resets in %d minutes. Sessions that hit the limit are force-stopped and lose unsaved progress. Consider wrapping up soon: record what is done, what is in flight, and the next concrete step somewhere durable, so a fresh session can pick this up.' \
+        "$pct" "$as_of" "$label" "$mins")"
 
     log "warned session ${session_id} at ${pct}% of ${label} window"
 }
@@ -106,14 +113,15 @@ warn_window() {
 breakage() {
     local session_id="$1" reason="$2" latch age
 
-    log "broken: ${reason}"
-
-    mkdir -p "$WARNED_DIR" 2>/dev/null || return 0
+    # Logged under the same latch as the agent notice. Logging on every tool
+    # call wrote thousands of identical lines per broken episode.
+    mkdir -p "$WARNED_DIR" 2>/dev/null || { log "broken: ${reason}"; return 0; }
     latch="${WARNED_DIR}/${session_id}__broken"
     if [ -e "$latch" ]; then
         age=$(( $(date '+%s') - $(file_mtime "$latch") ))
         [ "$age" -lt "$BREAKAGE_QUIET_SECONDS" ] && return 0
     fi
+    log "broken (session ${session_id}): ${reason}"
     : > "$latch" 2>/dev/null || return 0
 
     emit "The Claude Code usage monitor is not working: ${reason} - so you will NOT be warned before hitting the account usage limit. Mention this to the user."

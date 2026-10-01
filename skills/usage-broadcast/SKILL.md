@@ -21,8 +21,8 @@ exhausts them, all of them stop.
 
    If this exits non-zero, stop and report the error to the user verbatim. Do
    not broadcast a warning built on numbers you could not read. Exit code 4
-   means no session has published recently; 6 means the status line is not
-   installed.
+   means every published reading is for a window that has already reset; 6
+   means the status line is not installed.
 
 2. **List the other sessions.** Call `ListAgents`. It returns every peer
    session by name. Skip any session the user told you to leave alone.

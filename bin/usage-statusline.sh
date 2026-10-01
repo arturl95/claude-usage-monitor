@@ -22,6 +22,8 @@ set -u
 STATE_DIR="${CLAUDE_CONFIG_DIR}/usage-state"
 PRUNE_MARKER="${STATE_DIR}/.last-prune"
 PRUNE_INTERVAL=3600
+LOG="${STATE_DIR}/monitor.log"
+LOG_ROTATE_MARKER="${STATE_DIR}/.last-log-rotate"
 
 bail() {
     # Visible in the status line itself - the loudest channel available here.
@@ -114,6 +116,15 @@ if [ "$prune_due" -eq 1 ]; then
         fi
         find "${STATE_DIR}/warned" -type f -mtime +8 -delete 2>/dev/null
         find "${STATE_DIR}" -maxdepth 1 -name '.tmp.*' -mmin +60 -delete 2>/dev/null
+
+        # Weekly log rotation: the current log becomes monitor.log.1, replacing
+        # (and so deleting) the previous week's. At most two weeks are kept.
+        if [ ! -e "$LOG_ROTATE_MARKER" ]; then
+            : > "$LOG_ROTATE_MARKER"
+        elif [ -n "$(find "$LOG_ROTATE_MARKER" -mtime +6 2>/dev/null)" ]; then
+            [ -e "$LOG" ] && mv -f "$LOG" "${LOG}.1"
+            : > "$LOG_ROTATE_MARKER"
+        fi
     ) >/dev/null 2>&1 &
 fi
 

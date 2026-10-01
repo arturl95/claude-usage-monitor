@@ -149,7 +149,7 @@ If you are an AI coding agent and you need to know how much usage budget is left
 1. **Run `claude-usage --json`.** It returns the current 5-hour and 7-day usage
    percentages and their reset times. `--check` exits `3` when at or above the
    threshold and `0` when below, so you can branch on it directly.
-2. **Non-zero exit means don't guess.** `4` = state is stale, `6` = nothing has
+2. **Non-zero exit means don't guess.** `4` = every reading is for a window that has already reset, `6` = nothing has
    published yet, `7` = corrupt state. Report the error rather than assuming usage
    is fine.
 3. **If you are warned that usage is high**, finish or abandon the current step at
@@ -183,11 +183,14 @@ session's accurate reading — understating usage exactly when that matters most
 Separate files also mean writers never contend, so no lock is needed (macOS has
 no `flock`).
 
-**Merging.** Keep files written within `USAGE_FRESH_SECONDS`. Per window, take the
+**Merging.** Per window, drop readings whose window has already reset, take the
 newest `resets_at` seen — so a window rollover isn't averaged with the window it
 replaced — then the highest percentage reported for it. Usage only rises within a
-window, so the highest recent report is closest to the truth, and for an alarm the
-safe direction to err is high.
+window, so the highest report is closest to the truth, and for an alarm the safe
+direction to err is high. Readings are not dropped for being old: the status line
+only re-renders when the main conversation changes, so nothing is republished
+while a long subagent runs, yet an old reading for an open window is still a valid
+lower bound. `age_seconds` says how old the newest contributing reading is.
 
 **Latching.** Warnings are latched per session, per window, per `resets_at`.
 Without that the hook would fire on every single tool call and flood the context.
@@ -200,7 +203,6 @@ Because the key includes `resets_at`, a new window re-arms it by itself.
 | Variable | Default | |
 |---|---|---|
 | `USAGE_WARN_PCT` | `90` | Warn at this percentage |
-| `USAGE_FRESH_SECONDS` | `300` | Ignore state older than this |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config directory |
 
 ---
@@ -221,7 +223,7 @@ Everything else fails loudly. `claude-usage` distinguishes its failures:
 | Exit | Meaning |
 |---|---|
 | `3` | `--check` only: at or above threshold |
-| `4` | State is stale — files exist, none recent. Nothing is publishing. |
+| `4` | State is stale — files exist, but every window they report has reset. |
 | `5` | `jq` missing |
 | `6` | Nothing published yet — status line not installed, or session just started |
 | `7` | A state file is corrupt (the message names it) |
