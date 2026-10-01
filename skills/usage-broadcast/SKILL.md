@@ -46,6 +46,7 @@ exhausts them, all of them stop.
 ## Notes
 
 - This is advisory. Each session decides how to respond; nothing is forced.
-- The automatic `PreToolUse` hook already warns each session once per window.
+- The automatic `PreToolUse` hook already warns every session (main thread and
+  each subagent) at 90% and 97% of each window.
   Use this skill when you want to push the warning out immediately, for example
   after checking `/usage` yourself.

@@ -2,8 +2,14 @@
 #
 # usage-warn-hook.sh - Claude Code PreToolUse hook.
 #
-# Warns the agent once per window when account usage crosses the threshold, so
-# it can wrap up and write down its progress before being force-stopped.
+# Warns the agent when account usage crosses the threshold, so it can wrap up
+# and write down its progress before being force-stopped. Two tiers: a warning
+# at USAGE_WARN_PCT and a final one at USAGE_CRITICAL_PCT, each once per window.
+#
+# Subagents run under their parent's session_id, so they are told apart by the
+# agent_id the hook input carries for them. Each subagent and the main thread
+# latch separately - otherwise the first subagent to make a tool call swallows
+# the one warning meant for the main thread, which then never hears of it.
 #
 # THIS SCRIPT ALWAYS EXITS 0. A PreToolUse hook that exits non-zero blocks the
 # tool call; a monitor that can halt every session at once is worse than no
@@ -14,6 +20,7 @@ set -u
 
 : "${CLAUDE_CONFIG_DIR:=${HOME}/.claude}"
 : "${USAGE_WARN_PCT:=90}"
+: "${USAGE_CRITICAL_PCT:=97}"
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLAUDE_USAGE="${SELF_DIR}/claude-usage"
@@ -40,7 +47,7 @@ file_mtime() {
 }
 
 main() {
-    local input session_id state rc five_pct week_pct
+    local input session_id agent_id scope state rc five_pct week_pct
 
     input="$(cat)"
 
@@ -49,6 +56,14 @@ main() {
     session_id="$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null)"
     case "$session_id" in
         ""|*[!A-Za-z0-9._-]*) log "hook input carried no usable session_id"; return 0 ;;
+    esac
+
+    # Absent on main-thread calls, present on every subagent call.
+    agent_id="$(printf '%s' "$input" | jq -r '.agent_id // empty' 2>/dev/null)"
+    case "$agent_id" in
+        "") scope="main" ;;
+        *[!A-Za-z0-9._-]*) log "hook input carried an unusable agent_id (session ${session_id})"; return 0 ;;
+        *) scope="agent-${agent_id}" ;;
     esac
 
     [ -x "$CLAUDE_USAGE" ] || { log "claude-usage not found or not executable at ${CLAUDE_USAGE}"; return 0; }
@@ -71,10 +86,10 @@ main() {
     five_pct="$(printf '%s' "$state" | jq -r '.five_hour.used_percentage // empty' 2>/dev/null)"
     week_pct="$(printf '%s' "$state" | jq -r '.seven_day.used_percentage // empty' 2>/dev/null)"
 
-    warn_window "$session_id" "five_hour" "5-hour" "$five_pct" \
+    warn_window "$session_id" "$scope" "five_hour" "5-hour" "$five_pct" \
         "$(printf '%s' "$state" | jq -r '.five_hour.resets_at // empty' 2>/dev/null)" \
         "$(printf '%s' "$state" | jq -r '.five_hour.age_seconds // empty' 2>/dev/null)"
-    warn_window "$session_id" "seven_day" "7-day" "$week_pct" \
+    warn_window "$session_id" "$scope" "seven_day" "7-day" "$week_pct" \
         "$(printf '%s' "$state" | jq -r '.seven_day.resets_at // empty' 2>/dev/null)" \
         "$(printf '%s' "$state" | jq -r '.seven_day.age_seconds // empty' 2>/dev/null)"
 
@@ -82,19 +97,27 @@ main() {
 }
 
 warn_window() {
-    local session_id="$1" key="$2" label="$3" pct="$4" resets="$5" age="$6"
-    local latch mins as_of
+    local session_id="$1" scope="$2" key="$3" label="$4" pct="$5" resets="$6" age="$7"
+    local tier latch mins as_of headline
 
     [ -n "$pct" ] && [ -n "$resets" ] && [ -n "$age" ] || return 0
-    awk -v a="$pct" -v b="$USAGE_WARN_PCT" 'BEGIN { exit !(a >= b) }' || return 0
+    if awk -v a="$pct" -v b="$USAGE_CRITICAL_PCT" 'BEGIN { exit !(a >= b) }'; then
+        tier="critical"
+    elif awk -v a="$pct" -v b="$USAGE_WARN_PCT" 'BEGIN { exit !(a >= b) }'; then
+        tier="warn"
+    else
+        return 0
+    fi
 
-    # Latched per session, per window, per reset time. Without this the hook
-    # would inject on every single tool call and flood the context. Because the
-    # key includes resets_at, a new window re-arms the warning by itself.
+    # Latched per session, per agent, per window, per tier, per reset time.
+    # Without this the hook would inject on every single tool call and flood the
+    # context. Because the key includes resets_at, a new window re-arms it.
     mkdir -p "$WARNED_DIR" 2>/dev/null || return 0
-    latch="${WARNED_DIR}/${session_id}__${key}__${resets}"
+    latch="${WARNED_DIR}/${session_id}__${scope}__${key}__${tier}__${resets}"
     [ -e "$latch" ] && return 0
     : > "$latch" 2>/dev/null || return 0
+    # Reaching critical first makes the ordinary warning redundant.
+    [ "$tier" = "critical" ] && : > "${WARNED_DIR}/${session_id}__${scope}__${key}__warn__${resets}" 2>/dev/null
 
     mins=$(( (resets - $(date '+%s')) / 60 ))
     [ "$mins" -lt 0 ] && mins=0
@@ -104,10 +127,20 @@ warn_window() {
     as_of=""
     [ "$age" -ge 60 ] && as_of="$(printf ' (as of %d minutes ago - it may be higher now)' $(( age / 60 )))"
 
-    emit "$(printf 'Claude Code usage is at %.0f%%%s of the %s limit, which resets in %d minutes. Sessions that hit the limit are force-stopped and lose unsaved progress. Consider wrapping up soon: record what is done, what is in flight, and the next concrete step somewhere durable, so a fresh session can pick this up.' \
-        "$pct" "$as_of" "$label" "$mins")"
+    headline="USAGE LIMIT WARNING"
+    [ "$tier" = "critical" ] && headline="FINAL USAGE LIMIT WARNING"
 
-    log "warned session ${session_id} at ${pct}% of ${label} window"
+    # Worded as an instruction, not advice: agents read "consider wrapping up"
+    # as optional background and carried on without telling anyone.
+    if [ "$scope" = "main" ]; then
+        emit "$(printf '%s - act on this before your next step. Claude Code account usage is at %.0f%%%s of the %s limit, which resets in %d minutes. At 100%% this session is force-stopped mid-task and everything not written to disk is lost. Do this now: (1) write a progress note somewhere durable (the plan or spec you are working from, or PROGRESS.md in the working directory) covering what is done, what is in flight, and the next concrete step, so a fresh session can resume; (2) in your next message, tell the user the usage figure and where the note is. Then you may continue working.' \
+            "$headline" "$pct" "$as_of" "$label" "$mins")"
+    else
+        emit "$(printf '%s - act on this before your next step. Claude Code account usage is at %.0f%%%s of the %s limit, which resets in %d minutes. At 100%% every session is force-stopped mid-task. You are a subagent: bring your current step to a safe stopping point quickly and end your final report with the usage figure, what is done, what remains, and the next concrete step, so your parent can record it.' \
+            "$headline" "$pct" "$as_of" "$label" "$mins")"
+    fi
+
+    log "warned session ${session_id} (${scope}, ${tier}) at ${pct}% of ${label} window"
 }
 
 breakage() {

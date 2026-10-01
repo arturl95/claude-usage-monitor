@@ -31,17 +31,23 @@ agent. That asymmetry is the whole problem.
 
 ## The fix
 
-A warning, injected straight into the agent's context, once per limit window:
+A warning, injected straight into the agent's context at 90% and again at 97%
+of each limit window:
 
 ```
-Claude Code usage is at 94% of the 5-hour limit, which resets in 71 minutes.
-Sessions that hit the limit are force-stopped and lose unsaved progress.
-Consider wrapping up soon: record what is done, what is in flight, and the
-next concrete step somewhere durable, so a fresh session can pick this up.
+USAGE LIMIT WARNING - act on this before your next step. Claude Code account
+usage is at 94% of the 5-hour limit, which resets in 71 minutes. At 100% this
+session is force-stopped mid-task and everything not written to disk is lost.
+Do this now: (1) write a progress note somewhere durable (the plan or spec you
+are working from, or PROGRESS.md in the working directory) covering what is
+done, what is in flight, and the next concrete step, so a fresh session can
+resume; (2) in your next message, tell the user the usage figure and where the
+note is. Then you may continue working.
 ```
 
-The agent decides what to do about it. Nothing is forced, nothing is interrupted.
-It just stops being surprised.
+Subagents get their own version, telling them to stop at a safe point and put
+the same facts in their final report so the parent can record them. Nothing is
+blocked or interrupted: the agent saves its state, tells you, and carries on.
 
 ---
 
@@ -192,9 +198,16 @@ only re-renders when the main conversation changes, so nothing is republished
 while a long subagent runs, yet an old reading for an open window is still a valid
 lower bound. `age_seconds` says how old the newest contributing reading is.
 
-**Latching.** Warnings are latched per session, per window, per `resets_at`.
-Without that the hook would fire on every single tool call and flood the context.
-Because the key includes `resets_at`, a new window re-arms it by itself.
+**Latching.** Warnings are latched per session, per agent, per window, per tier,
+per `resets_at`. Without that the hook would fire on every single tool call and
+flood the context. Because the key includes `resets_at`, a new window re-arms it
+by itself.
+
+**Subagents.** A subagent runs under its parent's `session_id`; its hook input
+adds an `agent_id`. The main thread and each subagent latch separately. Latching
+on `session_id` alone let the first subagent to make a tool call swallow the only
+warning, so the main thread — the one that can save progress and talk to the
+user — never saw it.
 
 ---
 
@@ -203,6 +216,7 @@ Because the key includes `resets_at`, a new window re-arms it by itself.
 | Variable | Default | |
 |---|---|---|
 | `USAGE_WARN_PCT` | `90` | Warn at this percentage |
+| `USAGE_CRITICAL_PCT` | `97` | Warn a final time at this percentage |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config directory |
 
 ---

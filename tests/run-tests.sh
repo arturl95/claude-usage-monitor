@@ -39,6 +39,8 @@ JSON
 }
 
 hook_input() { printf '{"session_id":"%s","hook_event_name":"PreToolUse","tool_name":"Bash"}' "$1"; }
+# Subagent tool calls carry the parent's session_id plus their own agent_id.
+sub_input()  { printf '{"session_id":"%s","agent_id":"%s","agent_type":"general-purpose","hook_event_name":"PreToolUse","tool_name":"Bash"}' "$1" "$2"; }
 
 echo
 echo "claude-usage"
@@ -207,6 +209,49 @@ state s1 5 91 $((NOW+3600)) - 0
 out_a="$(hook_input sess-a | "$BIN/usage-warn-hook.sh")"
 out_b="$(hook_input sess-b | "$BIN/usage-warn-hook.sh")"
 has "latch is per-session -> other session still warned" "$out_b" "additionalContext"
+teardown
+
+setup
+state s1 5 91 $((NOW+3600)) - 0
+out="$(hook_input sess-a | "$BIN/usage-warn-hook.sh")"
+has "main thread -> told to act now" "$out" "before your next step"
+has "main thread -> told to tell the user" "$out" "tell the user"
+teardown
+
+setup
+state s1 5 91 $((NOW+3600)) - 0
+out_sub="$(sub_input sess-a agent1 | "$BIN/usage-warn-hook.sh")"
+has "subagent -> warned" "$out_sub" "additionalContext"
+has "subagent -> told to report to its parent" "$out_sub" "final report"
+out_main="$(hook_input sess-a | "$BIN/usage-warn-hook.sh")"
+has "subagent warning does not consume the main thread's" "$out_main" "before your next step"
+is  "subagent -> latched per agent" "$(sub_input sess-a agent1 | "$BIN/usage-warn-hook.sh")" ""
+has "other subagent -> still warned" "$(sub_input sess-a agent2 | "$BIN/usage-warn-hook.sh")" "final report"
+is  "main thread -> latched" "$(hook_input sess-a | "$BIN/usage-warn-hook.sh")" ""
+teardown
+
+setup
+state s1 5 91 $((NOW+3600)) - 0
+hook_input sess-a | "$BIN/usage-warn-hook.sh" >/dev/null
+rm -f "$CLAUDE_CONFIG_DIR/usage-state/s1.json"
+state s1 5 97 $((NOW+3600)) - 0   # same window, now critical
+out="$(hook_input sess-a | "$BIN/usage-warn-hook.sh")"
+has "critical tier -> warns again in the same window" "$out" "FINAL"
+is  "critical tier -> latched" "$(hook_input sess-a | "$BIN/usage-warn-hook.sh")" ""
+teardown
+
+setup
+state s1 5 98 $((NOW+3600)) - 0
+out="$(hook_input sess-a | "$BIN/usage-warn-hook.sh")"
+has "first reading already critical -> critical wording" "$out" "FINAL"
+is  "first reading already critical -> one warning only" "$(hook_input sess-a | "$BIN/usage-warn-hook.sh")" ""
+teardown
+
+setup
+state s1 5 91 $((NOW+3600)) - 0
+out="$(sub_input sess-a 'bad/../id' | "$BIN/usage-warn-hook.sh")"; rc=$?
+is  "unsafe agent_id -> exit 0" "$rc" 0
+has "unsafe agent_id -> logged" "$(cat "$CLAUDE_CONFIG_DIR/usage-state/monitor.log" 2>/dev/null)" "unusable agent_id"
 teardown
 
 setup
